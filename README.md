@@ -49,6 +49,7 @@ Optionally add settings to `~/.pi/agent/settings.json`.  For example:
 {
   "rewind": {
     "silentCheckpoints": true,
+    "excludeGlobs": ["**/*.uasset", "**/*.umap", "**/*.ubulk", "**/*.uexp"],
     "retention": {
       "maxSnapshots": 2000,
       "maxAgeDays": 30,
@@ -61,11 +62,16 @@ Optionally add settings to `~/.pi/agent/settings.json`.  For example:
 ### Settings
 
 - `rewind.silentCheckpoints` — hides footer/status and checkpoint notifications
+- `rewind.excludeGlobs` — optional array of Git glob pathspecs, relative to the repository root, omitted from checkpoints and protected from restore
 - `rewind.retention.maxSnapshots` — optional cap on unpinned unique snapshot commits kept reachable
 - `rewind.retention.maxAgeDays` — optional age limit for unpinned snapshot commits
 - `rewind.retention.pinLabeledEntries` — when true, snapshot commits bound to **labeled nodes** in the Pi session tree are exempt from `maxSnapshots` and `maxAgeDays` pruning (useful for bookmarking important rewind points you want to prevent getting garbage-collected)
 - `rewind.retention.scanMode` — retention discovery mode: `ancestor-only` (default, follow current session lineage only) or `repo-sessions` (scan discovered session roots)
 - `rewind.retention.startupBudgetMs` — optional startup time budget for retention sweeps; if exceeded, startup sweep is skipped and deferred
+
+Exclude patterns use Git `glob` pathspec matching with case-insensitive (`icase`) behavior on every platform. Use `/` as the path separator; `*` does not cross directories, while `**` does, so `**/*.uasset` matches both root-level and nested `.uasset` files. No file types are excluded by default.
+
+The current `excludeGlobs` setting is applied consistently when capturing, selecting paths for restore deletion, and restoring. It also protects matching files from historical snapshots made before the pattern was configured: restore will neither overwrite nor delete currently excluded paths. Changing the setting affects later checkpoints and restores, not existing snapshot contents; removing a pattern makes those paths eligible for normal restore again.
 
 If `rewind.retention` is omitted, Rewind keeps exact history with no automatic expiration. This can grow git object storage without bound over time.
 
@@ -173,10 +179,11 @@ Before creating a snapshot commit, Rewind captures the worktree tree SHA. If it 
 
 ### Restore exactness and scope
 
-Rewind restores the exact file state for the snapshot domain it owns:
+Rewind restores the exact file state for the snapshot domain it owns, subject to the current `rewind.excludeGlobs` rules:
 
 - tracked files
 - untracked, non-ignored files
+- paths matching current exclude globs (including submodule roots) are outside the snapshot domain and are never overwritten, deleted, or checked out by restore, even if a historical target snapshot contains them
 - without staging the real git index during restore
 
 Before restoring target contents, it deletes paths present in the current snapshot but absent from the target snapshot, then restores the target snapshot into the worktree only.

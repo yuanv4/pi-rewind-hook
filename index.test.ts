@@ -112,9 +112,9 @@ async function runGit(repoRoot: string, args: string[]): Promise<{ stdout: strin
 }
 
 function gitSubcommandOf(args: string[]): string {
-  // Skip global -c key=value options that precede the subcommand.
+  // Skip global -c and -C options that precede the subcommand.
   let index = 0;
-  while (args[index] === "-c") index += 2;
+  while (args[index] === "-c" || args[index] === "-C") index += 2;
   return args[index] ?? "";
 }
 
@@ -184,11 +184,13 @@ async function createSubmoduleFixture(repoRoot: string) {
 
 async function createHarness(options: {
   settings?: Record<string, unknown>;
+  execCwd?: string;
   failGitSubcommands?: string[];
   pauseGitSubcommand?: { name: string; occurrence: number };
 } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "rewind-ext-test-"));
   const repoRoot = path.join(root, "repo");
+  const execCwd = options.execCwd ? path.resolve(repoRoot, options.execCwd) : repoRoot;
   const agentDir = path.join(root, "agent");
   const sessionsDir = path.join(agentDir, "sessions", "--repo--");
   mkdirSync(repoRoot, { recursive: true });
@@ -224,7 +226,7 @@ async function createHarness(options: {
   const currentSession = new SessionManagerStub({
     sessionFile: path.join(sessionsDir, "session-1.jsonl"),
     id: "session-1",
-    cwd: repoRoot,
+    cwd: execCwd,
   });
   let activeSession = currentSession;
 
@@ -253,7 +255,7 @@ async function createHarness(options: {
         });
       }
 
-      return runGit(repoRoot, args);
+      return runGit(execCwd, args);
     },
     appendEntry: (customType: string, data: unknown) => {
       activeSession.appendCustom(customType, data);
@@ -272,7 +274,7 @@ async function createHarness(options: {
 
   function createContext(sessionManager: SessionManagerStub, hasUI = true) {
     return {
-      cwd: repoRoot,
+      cwd: execCwd,
       hasUI,
       sessionManager,
       ui: {
@@ -316,7 +318,7 @@ async function createHarness(options: {
       return new SessionManagerStub({
         sessionFile: path.join(sessionsDir, `${options.id}.jsonl`),
         id: options.id,
-        cwd: repoRoot,
+        cwd: execCwd,
         parentSession: options.parentSession,
         entries: options.entries,
       });
@@ -363,6 +365,428 @@ async function createHarness(options: {
     },
   };
 }
+
+test("excludeGlobs changes take effect at checkpoint boundaries without restarting the session", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    await harness.writeRepoFile("root.UASSET", "root asset\n");
+    await harness.writeRepoFile("Content/nested.uasset", "nested asset\n");
+    await harness.writeRepoFile("notes.txt", "notes\n");
+    await harness.invoke("session_start", {});
+
+    const capture = async (entryId: string) => {
+      harness.currentSession.replaceEntries([...harness.currentSession.getEntries(), markerEntry(entryId)]);
+      return checkpointTree(harness, entryId);
+    };
+    const treePaths = async (treeSha: string) => (await gitStdout(harness.repoRoot, ["ls-tree", "-r", "--name-only", treeSha])).split("\n");
+
+    const initialTree = await capture("initial-capture");
+    assert.deepEqual(await treePaths(initialTree), ["Content/nested.uasset", "notes.txt", "root.UASSET"]);
+
+    writeFileSync(path.join(harness.agentDir, "settings.json"), JSON.stringify({ rewind: { silentCheckpoints: true, excludeGlobs: ["**/*.uasset"] } }));
+    const addedRuleTree = await capture("added-rule-capture");
+    assert.deepEqual(await treePaths(addedRuleTree), ["notes.txt"]);
+
+    writeFileSync(path.join(harness.agentDir, "settings.json"), JSON.stringify({ rewind: { silentCheckpoints: true } }));
+    const removedRuleTree = await capture("removed-rule-capture");
+    assert.deepEqual(await treePaths(removedRuleTree), ["Content/nested.uasset", "notes.txt", "root.UASSET"]);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("restore with an excluded file in history still restores ordinary submodule state", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    const fixture = await createSubmoduleFixture(harness.repoRoot);
+    const secondSubmoduleCommit = await gitStdout(harness.repoRoot, ["-C", "nested", "rev-parse", "HEAD"]);
+    await runGitChecked(harness.repoRoot, ["-C", "nested", "checkout", "--detach", fixture.firstCommit]);
+    await runGitChecked(harness.repoRoot, ["add", "nested"]);
+    await harness.writeRepoFile("asset.uasset", "historical excluded content\n");
+    await harness.writeRepoFile("notes.txt", "historical notes\n");
+    const targetCommit = await harness.captureSnapshot();
+    assert.ok((await gitStdout(harness.repoRoot, ["ls-tree", "-r", "--name-only", targetCommit])).split("\n").includes("asset.uasset"));
+
+    await runGitChecked(harness.repoRoot, ["-C", "nested", "checkout", "--detach", secondSubmoduleCommit]);
+    await runGitChecked(harness.repoRoot, ["add", "nested"]);
+    await harness.writeRepoFile("asset.uasset", "current excluded content\n");
+    await harness.writeRepoFile("notes.txt", "current notes\n");
+    writeFileSync(path.join(harness.agentDir, "settings.json"), JSON.stringify({ rewind: { silentCheckpoints: true, excludeGlobs: ["**/*.uasset"] } }));
+    const indexBefore = readFileSync(path.join(harness.repoRoot, ".git", "index"));
+    const headBefore = await gitStdout(harness.repoRoot, ["rev-parse", "HEAD"]);
+
+    harness.currentSession.replaceEntries([
+      markerEntry("target-entry"),
+      {
+        type: "custom",
+        id: "target-op",
+        parentId: "target-entry",
+        timestamp: new Date().toISOString(),
+        customType: "rewind-op",
+        data: { v: 2, snapshots: [targetCommit], bindings: [["target-entry", 0]] },
+      },
+    ]);
+    await harness.invoke("session_start", {});
+    harness.enqueueSelection("Restore files to that point");
+    const restoreResult = await harness.invoke("session_before_tree", { preparation: { targetId: "target-entry" } });
+    assert.equal(restoreResult, undefined, JSON.stringify(harness.notifications));
+    await harness.invoke("session_tree", {});
+    const resultingOp = harness.currentSession.getEntries()
+      .filter((entry) => entry.type === "custom" && entry.customType === "rewind-op")
+      .at(-1)?.data as { snapshots: string[]; current?: number; undo?: number } | undefined;
+    const restoredCommitSha = resultingOp?.current === undefined ? undefined : resultingOp.snapshots[resultingOp.current];
+    assert.equal(restoredCommitSha, targetCommit);
+    assert.ok(typeof resultingOp?.undo === "number", "the prior projection is persisted as the undo state");
+
+    assert.equal(await gitStdout(harness.repoRoot, ["-C", "nested", "rev-parse", "HEAD"]), fixture.firstCommit);
+    assert.equal(harness.readRepoFile("nested/file.txt"), "submodule v1\n");
+    assert.equal(harness.readRepoFile("asset.uasset"), "current excluded content\n");
+    assert.equal(harness.readRepoFile("notes.txt"), "historical notes\n");
+    assert.deepEqual(readFileSync(path.join(harness.repoRoot, ".git", "index")), indexBefore);
+    assert.equal(await gitStdout(harness.repoRoot, ["rev-parse", "HEAD"]), headBefore);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("restore with an empty configured domain is a no-op rather than a pathspec error", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    await runGitChecked(harness.repoRoot, ["commit", "--allow-empty", "-m", "baseline"]);
+    await harness.writeRepoFile("notes.txt", "historical notes\n");
+    const targetCommit = await harness.captureSnapshot();
+    await harness.writeRepoFile("notes.txt", "current notes\n");
+    harness.currentSession.replaceEntries([
+      markerEntry("target-entry"),
+      {
+        type: "custom",
+        id: "target-op",
+        parentId: "target-entry",
+        timestamp: new Date().toISOString(),
+        customType: "rewind-op",
+        data: { v: 2, snapshots: [targetCommit], bindings: [["target-entry", 0]] },
+      },
+    ]);
+    await harness.invoke("session_start", {});
+    writeFileSync(path.join(harness.agentDir, "settings.json"), JSON.stringify({ rewind: { silentCheckpoints: true, excludeGlobs: ["**/*"] } }));
+    const indexBefore = readFileSync(path.join(harness.repoRoot, ".git", "index"));
+
+    harness.enqueueSelection("Restore files to that point");
+    const restoreResult = await harness.invoke("session_before_tree", { preparation: { targetId: "target-entry" } });
+    assert.equal(restoreResult, undefined, JSON.stringify(harness.notifications));
+    assert.equal(harness.readRepoFile("notes.txt"), "current notes\n");
+    assert.deepEqual(readFileSync(path.join(harness.repoRoot, ".git", "index")), indexBefore);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("a submodule path matching excludeGlobs is neither preflighted nor restored", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    const fixture = await createSubmoduleFixture(harness.repoRoot);
+    const secondSubmoduleCommit = await gitStdout(harness.repoRoot, ["-C", "nested", "rev-parse", "HEAD"]);
+    await runGitChecked(harness.repoRoot, ["-C", "nested", "checkout", "--detach", fixture.firstCommit]);
+    await runGitChecked(harness.repoRoot, ["add", "nested"]);
+    await harness.writeRepoFile("notes.txt", "historical notes\n");
+    const targetCommit = await harness.captureSnapshot();
+
+    await runGitChecked(harness.repoRoot, ["-C", "nested", "checkout", "--detach", secondSubmoduleCommit]);
+    await runGitChecked(harness.repoRoot, ["add", "nested"]);
+    await harness.writeRepoFile("nested/file.txt", "dirty excluded submodule\n");
+    await harness.writeRepoFile("notes.txt", "current notes\n");
+    writeFileSync(path.join(harness.agentDir, "settings.json"), JSON.stringify({ rewind: { silentCheckpoints: true, excludeGlobs: ["nested"] } }));
+    const indexBefore = readFileSync(path.join(harness.repoRoot, ".git", "index"));
+    harness.currentSession.replaceEntries([
+      markerEntry("target-entry"),
+      {
+        type: "custom",
+        id: "target-op",
+        parentId: "target-entry",
+        timestamp: new Date().toISOString(),
+        customType: "rewind-op",
+        data: { v: 2, snapshots: [targetCommit], bindings: [["target-entry", 0]] },
+      },
+    ]);
+    await harness.invoke("session_start", {});
+    harness.enqueueSelection("Restore files to that point");
+
+    const restoreResult = await harness.invoke("session_before_tree", { preparation: { targetId: "target-entry" } });
+    assert.equal(restoreResult, undefined, JSON.stringify(harness.notifications));
+    assert.equal(await gitStdout(harness.repoRoot, ["-C", "nested", "rev-parse", "HEAD"]), secondSubmoduleCommit);
+    assert.equal(harness.readRepoFile("nested/file.txt"), "dirty excluded submodule\n");
+    assert.equal(harness.readRepoFile("notes.txt"), "historical notes\n");
+    assert.deepEqual(readFileSync(path.join(harness.repoRoot, ".git", "index")), indexBefore);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("a changed restore followed by session_tree does not reuse a full historical tree for a filtered checkpoint", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true, excludeGlobs: ["**/*.uasset"] } } });
+
+  try {
+    await runGitChecked(harness.repoRoot, ["commit", "--allow-empty", "-m", "baseline"]);
+    await harness.writeRepoFile("asset.uasset", "historical asset\\n");
+    await harness.writeRepoFile("notes.txt", "historical notes\\n");
+    const targetCommit = await harness.captureSnapshot();
+    await rm(path.join(harness.repoRoot, "asset.uasset"));
+    await harness.writeRepoFile("notes.txt", "current notes\\n");
+    harness.currentSession.replaceEntries([
+      markerEntry("target-entry"),
+      {
+        type: "custom",
+        id: "target-op",
+        parentId: "target-entry",
+        timestamp: new Date().toISOString(),
+        customType: "rewind-op",
+        data: { v: 2, snapshots: [targetCommit], bindings: [["target-entry", 0]] },
+      },
+    ]);
+    await harness.invoke("session_start", {});
+    harness.enqueueSelection("Restore files to that point");
+    assert.equal(await harness.invoke("session_before_tree", { preparation: { targetId: "target-entry" } }), undefined);
+    assert.equal(harness.readRepoFile("notes.txt"), "historical notes\\n");
+    assert.equal(existsSync(path.join(harness.repoRoot, "asset.uasset")), false);
+
+    await harness.invoke("session_tree", {});
+    harness.currentSession.replaceEntries([...harness.currentSession.getEntries(), markerEntry("after-restore-checkpoint")]);
+    const checkpointTreeSha = await checkpointTree(harness, "after-restore-checkpoint");
+    const checkpointPaths = await gitStdout(harness.repoRoot, ["ls-tree", "-r", "--name-only", checkpointTreeSha]);
+    assert.equal(checkpointPaths.split("\n").includes("asset.uasset"), false);
+    assert.ok(checkpointPaths.split("\n").includes("notes.txt"));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("a no-op restore and resume cannot pair a filtered tree with its historical full commit", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true, excludeGlobs: ["**/*.uasset"] } } });
+
+  try {
+    await runGitChecked(harness.repoRoot, ["commit", "--allow-empty", "-m", "baseline"]);
+    await harness.writeRepoFile("asset.uasset", "historical asset\\n");
+    await harness.writeRepoFile("notes.txt", "historical notes\\n");
+    const targetCommit = await harness.captureSnapshot();
+    await rm(path.join(harness.repoRoot, "asset.uasset"));
+    harness.currentSession.replaceEntries([
+      markerEntry("target-entry"),
+      {
+        type: "custom",
+        id: "target-op",
+        parentId: "target-entry",
+        timestamp: new Date().toISOString(),
+        customType: "rewind-op",
+        data: { v: 2, snapshots: [targetCommit], bindings: [["target-entry", 0]] },
+      },
+    ]);
+    await harness.invoke("session_start", {});
+    harness.enqueueSelection("Restore files to that point");
+    assert.equal(await harness.invoke("session_before_tree", { preparation: { targetId: "target-entry" } }), undefined);
+    await harness.invoke("session_tree", {});
+    await harness.invoke("session_start", { reason: "resume" });
+
+    writeFileSync(path.join(harness.agentDir, "settings.json"), JSON.stringify({ rewind: { silentCheckpoints: true } }));
+    harness.currentSession.replaceEntries([...harness.currentSession.getEntries(), markerEntry("after-remove-checkpoint")]);
+    const checkpointTreeSha = await checkpointTree(harness, "after-remove-checkpoint");
+    const checkpointPaths = await gitStdout(harness.repoRoot, ["ls-tree", "-r", "--name-only", checkpointTreeSha]);
+    assert.equal(checkpointPaths.split("\n").includes("asset.uasset"), false);
+
+    await harness.writeRepoFile("notes.txt", "later notes\\n");
+    harness.enqueueSelection("Restore files to that point");
+    assert.equal(await harness.invoke("session_before_tree", { preparation: { targetId: "after-remove-checkpoint" } }), undefined);
+    assert.equal(existsSync(path.join(harness.repoRoot, "asset.uasset")), false);
+    assert.equal(harness.readRepoFile("notes.txt"), "historical notes\\n");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("restore and checkpoints stay repository-root relative from a nested session cwd", async () => {
+  const harness = await createHarness({
+    execCwd: "Content",
+    settings: { rewind: { silentCheckpoints: true, excludeGlobs: ["Content/*.uasset"] } },
+  });
+
+  try {
+    await runGitChecked(harness.repoRoot, ["commit", "--allow-empty", "-m", "baseline"]);
+    await harness.writeRepoFile("root.txt", "root target\\n");
+    await harness.writeRepoFile("Content/asset.uasset", "historical asset\\n");
+    await harness.writeRepoFile("Content/ordinary.txt", "content target\\n");
+    await harness.writeRepoFile("Content/nested/deep.txt", "nested target\\n");
+    const targetCommit = await harness.captureSnapshot();
+
+    await rm(path.join(harness.repoRoot, "Content/asset.uasset"));
+    await harness.writeRepoFile("root.txt", "root current\\n");
+    await harness.writeRepoFile("Content/ordinary.txt", "content current\\n");
+    await harness.writeRepoFile("Content/nested/deep.txt", "nested current\\n");
+    const indexBefore = readFileSync(path.join(harness.repoRoot, ".git", "index"));
+    const headBefore = await gitStdout(harness.repoRoot, ["rev-parse", "HEAD"]);
+    harness.currentSession.replaceEntries([
+      markerEntry("target-entry"),
+      {
+        type: "custom",
+        id: "target-op",
+        parentId: "target-entry",
+        timestamp: new Date().toISOString(),
+        customType: "rewind-op",
+        data: { v: 2, snapshots: [targetCommit], bindings: [["target-entry", 0]] },
+      },
+    ]);
+    await harness.invoke("session_start", {});
+    harness.enqueueSelection("Restore files to that point");
+
+    assert.equal(await harness.invoke("session_before_tree", { preparation: { targetId: "target-entry" } }), undefined);
+    assert.equal(harness.readRepoFile("root.txt"), "root target\\n");
+    assert.equal(harness.readRepoFile("Content/ordinary.txt"), "content target\\n");
+    assert.equal(harness.readRepoFile("Content/nested/deep.txt"), "nested target\\n");
+    assert.equal(existsSync(path.join(harness.repoRoot, "Content/asset.uasset")), false);
+    assert.deepEqual(readFileSync(path.join(harness.repoRoot, ".git", "index")), indexBefore);
+    assert.equal(await gitStdout(harness.repoRoot, ["rev-parse", "HEAD"]), headBefore);
+
+    harness.currentSession.replaceEntries([...harness.currentSession.getEntries(), markerEntry("root-relative-checkpoint")]);
+    const checkpointTreeSha = await checkpointTree(harness, "root-relative-checkpoint");
+    const checkpointPaths = (await gitStdout(harness.repoRoot, ["ls-tree", "-r", "--name-only", checkpointTreeSha])).split("\n");
+    assert.deepEqual(checkpointPaths, ["Content/nested/deep.txt", "Content/ordinary.txt", "root.txt"]);
+    assert.ok(harness.execCalls.some((args) => args[0] === "git" && args[1] === "-C" && args[2] === harness.repoRoot));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("diff.ignoreSubmodules=all does not hide gitlinks from restore with or without excludes", async () => {
+  for (const excludeGlobs of [undefined, ["**/*.uasset"]]) {
+    const settings = { rewind: { silentCheckpoints: true, ...(excludeGlobs ? { excludeGlobs } : {}) } };
+    const harness = await createHarness({ settings });
+
+    try {
+      const fixture = await createSubmoduleFixture(harness.repoRoot);
+      const secondSubmoduleCommit = await gitStdout(harness.repoRoot, ["-C", "nested", "rev-parse", "HEAD"]);
+      await runGitChecked(harness.repoRoot, ["-C", "nested", "checkout", "--detach", fixture.firstCommit]);
+      await runGitChecked(harness.repoRoot, ["add", "nested"]);
+      const targetCommit = await harness.captureSnapshot();
+      await runGitChecked(harness.repoRoot, ["-C", "nested", "checkout", "--detach", secondSubmoduleCommit]);
+      await runGitChecked(harness.repoRoot, ["add", "nested"]);
+      await runGitChecked(harness.repoRoot, ["config", "diff.ignoreSubmodules", "all"]);
+      const indexBefore = readFileSync(path.join(harness.repoRoot, ".git", "index"));
+      harness.currentSession.replaceEntries([
+        markerEntry("target-entry"),
+        {
+          type: "custom",
+          id: "target-op",
+          parentId: "target-entry",
+          timestamp: new Date().toISOString(),
+          customType: "rewind-op",
+          data: { v: 2, snapshots: [targetCommit], bindings: [["target-entry", 0]] },
+        },
+      ]);
+      await harness.invoke("session_start", {});
+      harness.enqueueSelection("Restore files to that point");
+
+      const result = await harness.invoke("session_before_tree", { preparation: { targetId: "target-entry" } });
+      assert.equal(result, undefined, `excludeGlobs=${JSON.stringify(excludeGlobs)}: ${JSON.stringify(harness.notifications)}`);
+      assert.equal(await gitStdout(harness.repoRoot, ["-C", "nested", "rev-parse", "HEAD"]), fixture.firstCommit);
+      assert.equal(harness.readRepoFile("nested/file.txt"), "submodule v1\n");
+      assert.deepEqual(readFileSync(path.join(harness.repoRoot, ".git", "index")), indexBefore);
+    } finally {
+      await harness.cleanup();
+    }
+  }
+});
+
+test("configured excludes keep historical, tracked, and untracked files safe during checkpoint and restore", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    await runGitChecked(harness.repoRoot, ["commit", "--allow-empty", "-m", "baseline"]);
+    await harness.writeRepoFile("Content/asset.UASSET", "historical asset\n");
+    await harness.writeRepoFile("Content/deleted.uasset", "historical deleted asset\n");
+    await harness.writeRepoFile("notes.txt", "historical notes\n");
+    const targetCommit = await harness.captureSnapshot();
+    assert.ok((await gitStdout(harness.repoRoot, ["ls-tree", "-r", "--name-only", targetCommit])).split("\n").includes("Content/asset.UASSET"));
+
+    await harness.writeRepoFile("Content/asset.UASSET", "current asset\n");
+    await rm(path.join(harness.repoRoot, "Content/deleted.uasset"));
+    await harness.writeRepoFile("Content/new-tracked.uasset", "new tracked asset\n");
+    await runGitChecked(harness.repoRoot, ["add", "Content/new-tracked.uasset"]);
+    await harness.writeRepoFile("Content/new-untracked.UASSET", "new untracked asset\n");
+    await harness.writeRepoFile("notes.txt", "current notes\n");
+    await harness.writeRepoFile("staged.txt", "staged version\n");
+    await runGitChecked(harness.repoRoot, ["add", "staged.txt"]);
+    await harness.writeRepoFile("staged.txt", "worktree version\n");
+
+    const settingsFile = path.join(harness.agentDir, "settings.json");
+    writeFileSync(settingsFile, JSON.stringify({ rewind: { silentCheckpoints: true, excludeGlobs: ["**/*.uasset"] } }));
+    const indexBefore = readFileSync(path.join(harness.repoRoot, ".git", "index"));
+    const headBefore = await gitStdout(harness.repoRoot, ["rev-parse", "HEAD"]);
+
+    harness.currentSession.replaceEntries([
+      markerEntry("target-entry"),
+      {
+        type: "custom",
+        id: "target-op",
+        parentId: "target-entry",
+        timestamp: new Date().toISOString(),
+        customType: "rewind-op",
+        data: { v: 2, snapshots: [targetCommit], bindings: [["target-entry", 0]] },
+      },
+    ]);
+    await harness.invoke("session_start", {});
+
+    harness.currentSession.replaceEntries([
+      markerEntry("target-entry"),
+      {
+        type: "custom",
+        id: "target-op",
+        parentId: "target-entry",
+        timestamp: new Date().toISOString(),
+        customType: "rewind-op",
+        data: { v: 2, snapshots: [targetCommit], bindings: [["target-entry", 0]] },
+      },
+      markerEntry("capture-entry"),
+    ]);
+    const captureTree = await checkpointTree(harness, "capture-entry");
+    const capturedPaths = await gitStdout(harness.repoRoot, ["ls-tree", "-r", "--name-only", captureTree]);
+    assert.equal(capturedPaths.split("\n").some((entryPath) => entryPath.toLowerCase().endsWith(".uasset")), false);
+    assert.ok(capturedPaths.split("\n").includes("notes.txt"));
+
+    harness.enqueueSelection("Restore files to that point");
+    assert.equal(await harness.invoke("session_before_tree", { preparation: { targetId: "target-entry" } }), undefined);
+
+    assert.equal(harness.readRepoFile("Content/asset.UASSET"), "current asset\n");
+    assert.equal(harness.readRepoFile("Content/new-tracked.uasset"), "new tracked asset\n");
+    assert.equal(harness.readRepoFile("Content/new-untracked.UASSET"), "new untracked asset\n");
+    assert.equal(existsSync(path.join(harness.repoRoot, "Content/deleted.uasset")), false);
+    assert.equal(harness.readRepoFile("notes.txt"), "historical notes\n");
+    assert.deepEqual(readFileSync(path.join(harness.repoRoot, ".git", "index")), indexBefore);
+    assert.equal(await gitStdout(harness.repoRoot, ["rev-parse", "HEAD"]), headBefore);
+
+    const expectedExclude = ":(exclude,glob,icase)**/*.uasset";
+    const filteredDiffPaths = (await gitStdout(harness.repoRoot, [
+      "diff",
+      "--name-only",
+      "-z",
+      captureTree,
+      targetCommit,
+      "--",
+      ".",
+      expectedExclude,
+    ])).split("\0").filter(Boolean);
+    assert.deepEqual(filteredDiffPaths, ["notes.txt", "staged.txt"]);
+    assert.equal(filteredDiffPaths.some((entryPath) => entryPath.toLowerCase().endsWith(".uasset")), false);
+
+    const diffCall = harness.execCalls.findLast((args) => args.includes("diff"));
+    const restoreCall = harness.execCalls.findLast((args) => args.includes("restore"));
+    assert.ok(diffCall?.includes(expectedExclude), "internal deletion diff uses the configured exclude pathspec");
+    assert.ok(restoreCall?.includes(expectedExclude), "worktree restore uses the configured exclude pathspec");
+  } finally {
+    await harness.cleanup();
+  }
+});
 
 test("/fork undo restores files into a child session instead of cancelling the fork", async () => {
   const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
