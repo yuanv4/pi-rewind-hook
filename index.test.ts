@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { mkdtemp, rename, rm, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, rename, rm, utimes, writeFile } from "node:fs/promises";
 import test from "node:test";
 import os from "node:os";
 import path from "node:path";
@@ -1162,6 +1162,34 @@ async function assertCheckpointsMatchFreshIndex(harness: Harness, steps: Array<[
   }
 }
 
+test("ignored directories do not break staging while tracked deletions are captured", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+  const repoPath = (relativePath: string) => path.join(harness.repoRoot, relativePath);
+
+  try {
+    harness.currentSession.replaceEntries([markerEntry("before-ignored-build"), markerEntry("ignored-build")]);
+    await harness.invoke("session_start", {});
+    await harness.writeRepoFile("keep.txt", "keep\n");
+    await harness.writeRepoFile("delete.txt", "delete\n");
+    await harness.writeRepoFile("wild[1].txt", "literal pathspec\n");
+    await checkpointTree(harness, "before-ignored-build");
+    await harness.writeRepoFile(".gitignore", "Build/\n");
+    await harness.writeRepoFile("Build/output.txt", "ignored build output\n");
+    await rm(repoPath("delete.txt"));
+
+    assert.equal(await gitStdout(harness.repoRoot, ["check-ignore", "Build/output.txt"]), "Build/output.txt");
+    const tree = await checkpointTree(harness, "ignored-build");
+    const paths = (await gitStdout(harness.repoRoot, ["ls-tree", "-r", "--name-only", tree])).split("\n");
+    assert.ok(paths.includes("keep.txt"));
+    assert.ok(paths.includes("wild[1].txt"));
+    assert.ok(!paths.includes("Build/output.txt"));
+    assert.ok(!paths.includes("delete.txt"));
+    assert.equal(tree, await freshIndexTree(harness.repoRoot));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("checkpoints match a fresh index across edits, ignores and case-only renames", async () => {
   const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
   const repoPath = (relativePath: string) => path.join(harness.repoRoot, relativePath);
@@ -1183,6 +1211,44 @@ test("checkpoints match a fresh index across edits, ignores and case-only rename
       ["newly ignored file", () => harness.writeRepoFile(".gitignore", "dir/\n")],
       ["case-only file rename", () => renameViaTemp(repoPath("a.txt"), repoPath("A.txt"))],
       ["case-only directory rename", () => renameViaTemp(repoPath("new"), repoPath("New"))],
+    ]);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("stale index rebuild stages a case rename from an empty index", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+  const oldPath = path.join(harness.repoRoot, "case-old.txt");
+  const newPath = path.join(harness.repoRoot, "CASE-OLD.txt");
+
+  try {
+    await runGitChecked(harness.repoRoot, ["config", "core.ignorecase", "true"]);
+    await assertCheckpointsMatchFreshIndex(harness, [
+      ["initial spelling", () => harness.writeRepoFile("case-old.txt", "before\n")],
+      ["case-only rename forces a fresh index", () => renameViaTemp(oldPath, newPath)],
+    ]);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("stale index rebuild captures case-only rename on case-insensitive filesystems", async (t) => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+  const lower = path.join(harness.repoRoot, "case-probe.txt");
+  const upper = path.join(harness.repoRoot, "CASE-PROBE.txt");
+
+  try {
+    await writeFile(lower, "probe\n");
+    if (!existsSync(upper)) {
+      t.skip("filesystem is case-sensitive");
+      return;
+    }
+    await assertCheckpointsMatchFreshIndex(harness, [
+      ["initial spelling", async () => {
+        await harness.writeRepoFile("case-probe.txt", "before\n");
+      }],
+      ["case-only rename after stale-index rebuild", () => renameViaTemp(lower, upper)],
     ]);
   } finally {
     await harness.cleanup();
@@ -1350,6 +1416,319 @@ test("snapshots and restores exclude Git LFS paths without requiring Git LFS", a
     harness.enqueueSelection("Restore files to that point");
     assert.equal(await harness.invoke("session_before_tree", { preparation: { targetId: "lfs-target" } }), undefined);
     assert.equal(harness.readRepoFile("nested/deleted.bin"), "target nested bytes\n");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("restore rejects collisions with protected LFS descendants without changing the worktree", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    await harness.writeRepoFile("slot", "target regular file\n");
+    await harness.writeRepoFile("safe.txt", "before safe\n");
+    const targetCommit = await harness.captureSnapshot();
+
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.process", ""]);
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.clean", "false"]);
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.required", "true"]);
+    harness.currentSession.replaceEntries([
+      { type: "message", id: "protected-descendant-target", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: [{ type: "text", text: "target" }] } },
+      {
+        type: "custom", id: "protected-descendant-op", parentId: "protected-descendant-target",
+        timestamp: new Date().toISOString(), customType: "rewind-op",
+        data: { v: 2, snapshots: [targetCommit], bindings: [["protected-descendant-target", 0]] },
+      },
+    ]);
+    await harness.invoke("session_start", {});
+    await rm(path.join(harness.repoRoot, "slot"));
+    await harness.writeRepoFile("slot/keep.asset", "protected data\n");
+    await harness.writeRepoFile("slot/.git/HEAD", "ref: refs/heads/main\n");
+    await harness.writeRepoFile(".gitattributes", "*.asset filter=lfs\n");
+    await harness.writeRepoFile(".gitignore", "slot/keep.asset\n");
+    await harness.writeRepoFile("safe.txt", "current safe\n");
+    assert.equal(await gitStdout(harness.repoRoot, ["check-ignore", "slot/keep.asset"]), "slot/keep.asset");
+    harness.enqueueSelection("Restore files to that point");
+    assert.deepEqual(await harness.invoke("session_before_tree", { preparation: { targetId: "protected-descendant-target" } }), { cancel: true });
+    assert.equal(harness.readRepoFile("slot/keep.asset"), "protected data\n");
+    assert.equal(harness.readRepoFile("slot/.git/HEAD"), "ref: refs/heads/main\n");
+    assert.equal(harness.readRepoFile(".gitattributes"), "*.asset filter=lfs\n");
+    assert.equal(harness.readRepoFile("safe.txt"), "current safe\n");
+    assert.equal(existsSync(path.join(harness.repoRoot, "slot")), true);
+    assert.match(harness.notifications.at(-1)?.message ?? "", /conflicts with protected LFS path slot\/keep\.asset/);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("restoring a missing target below an existing directory preserves protected siblings", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    await harness.writeRepoFile(".gitattributes", "*.asset filter=lfs\n");
+    await harness.writeRepoFile("dir/new.txt", "target note\n");
+    const targetCommit = await harness.captureSnapshot();
+    harness.currentSession.replaceEntries([
+      { type: "message", id: "missing-child-target", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: [{ type: "text", text: "target" }] } },
+      { type: "custom", id: "missing-child-op", parentId: "missing-child-target", timestamp: new Date().toISOString(), customType: "rewind-op", data: { v: 2, snapshots: [targetCommit], bindings: [["missing-child-target", 0]] } },
+    ]);
+    await harness.invoke("session_start", {});
+    await rm(path.join(harness.repoRoot, "dir/new.txt"));
+    await harness.writeRepoFile("dir/keep.asset", "protected sibling\n");
+    await harness.writeRepoFile(".gitignore", "dir/keep.asset\n");
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.process", ""]);
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.clean", "false"]);
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.required", "true"]);
+    harness.enqueueSelection("Restore files to that point");
+    assert.equal(await harness.invoke("session_before_tree", { preparation: { targetId: "missing-child-target" } }), undefined);
+    assert.equal(harness.readRepoFile("dir/keep.asset"), "protected sibling\n");
+    assert.equal(harness.readRepoFile("dir/new.txt"), "target note\n");
+    assert.equal(harness.readRepoFile(".gitattributes"), "*.asset filter=lfs\n");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("case-insensitive worktrees reject protected-path spelling collisions", async (t) => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    const probe = path.join(harness.repoRoot, "case-probe");
+    await writeFile(probe, "probe");
+    if (!existsSync(path.join(harness.repoRoot, "CASE-PROBE"))) {
+      t.skip("filesystem is case-sensitive; case-insensitive behavior not exercised");
+      return;
+    }
+    await rm(probe);
+
+    await harness.writeRepoFile("Slot", "target file\n");
+    await harness.writeRepoFile("safe.txt", "safe before\n");
+    const targetCommit = await harness.captureSnapshot();
+    harness.currentSession.replaceEntries([
+      { type: "message", id: "case-target", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: [{ type: "text", text: "target" }] } },
+      { type: "custom", id: "case-op", parentId: "case-target", timestamp: new Date().toISOString(), customType: "rewind-op", data: { v: 2, snapshots: [targetCommit], bindings: [["case-target", 0]] } },
+    ]);
+    await harness.invoke("session_start", {});
+    await rm(path.join(harness.repoRoot, "Slot"));
+    await harness.writeRepoFile("slot/keep.asset", "protected data\n");
+    await harness.writeRepoFile(".gitattributes", "*.asset filter=lfs\n");
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.process", ""]);
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.clean", "false"]);
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.required", "true"]);
+    harness.enqueueSelection("Restore files to that point");
+    assert.deepEqual(await harness.invoke("session_before_tree", { preparation: { targetId: "case-target" } }), { cancel: true });
+    assert.equal(harness.readRepoFile("slot/keep.asset"), "protected data\n");
+    assert.equal(harness.readRepoFile("safe.txt"), "safe before\n");
+    assert.equal(harness.readRepoFile(".gitattributes"), "*.asset filter=lfs\n");
+    assert.match(harness.notifications.at(-1)?.message ?? "", /conflicts with protected LFS path/i);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("case-insensitive worktrees reject a protected ancestor with different casing", async (t) => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    const probe = path.join(harness.repoRoot, "case-probe");
+    await writeFile(probe, "probe");
+    if (!existsSync(path.join(harness.repoRoot, "CASE-PROBE"))) {
+      t.skip("filesystem is case-sensitive; case-insensitive behavior not exercised");
+      return;
+    }
+    await rm(probe);
+    await harness.writeRepoFile(".gitattributes", "Slot filter=lfs\nslot filter=lfs\n");
+    await harness.writeRepoFile("slot/notes.txt", "target note\n");
+    const targetCommit = await harness.captureSnapshot();
+    harness.currentSession.replaceEntries([
+      { type: "message", id: "case-ancestor-target", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: [{ type: "text", text: "target" }] } },
+      { type: "custom", id: "case-ancestor-op", parentId: "case-ancestor-target", timestamp: new Date().toISOString(), customType: "rewind-op", data: { v: 2, snapshots: [targetCommit], bindings: [["case-ancestor-target", 0]] } },
+    ]);
+    await harness.invoke("session_start", {});
+    await rm(path.join(harness.repoRoot, "slot"), { recursive: true });
+    await harness.writeRepoFile("Slot", "protected asset\n");
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.process", ""]);
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.clean", "false"]);
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.required", "true"]);
+    harness.enqueueSelection("Restore files to that point");
+    assert.deepEqual(await harness.invoke("session_before_tree", { preparation: { targetId: "case-ancestor-target" } }), { cancel: true });
+    assert.equal(harness.readRepoFile("Slot"), "protected asset\n");
+    assert.match(harness.notifications.at(-1)?.message ?? "", /conflicts with protected LFS path/i);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("case-insensitive worktrees reject an exact protected-path spelling alias", async (t) => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    const probe = path.join(harness.repoRoot, "case-probe");
+    await writeFile(probe, "probe");
+    if (!existsSync(path.join(harness.repoRoot, "CASE-PROBE"))) {
+      t.skip("filesystem is case-sensitive; case-insensitive behavior not exercised");
+      return;
+    }
+    await rm(probe);
+    await harness.writeRepoFile("asset.bin", "target asset\n");
+    const targetCommit = await harness.captureSnapshot();
+    harness.currentSession.replaceEntries([
+      { type: "message", id: "case-exact-target", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: [{ type: "text", text: "target" }] } },
+      { type: "custom", id: "case-exact-op", parentId: "case-exact-target", timestamp: new Date().toISOString(), customType: "rewind-op", data: { v: 2, snapshots: [targetCommit], bindings: [["case-exact-target", 0]] } },
+    ]);
+    await harness.invoke("session_start", {});
+    await rm(path.join(harness.repoRoot, "asset.bin"));
+    await harness.writeRepoFile("ASSET.BIN", "protected asset\n");
+    await harness.writeRepoFile(".gitattributes", "*.bin filter=lfs\n*.BIN filter=lfs\n");
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.process", ""]);
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.clean", "false"]);
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.required", "true"]);
+    harness.enqueueSelection("Restore files to that point");
+    assert.deepEqual(await harness.invoke("session_before_tree", { preparation: { targetId: "case-exact-target" } }), { cancel: true });
+    assert.equal(harness.readRepoFile("ASSET.BIN"), "protected asset\n");
+    assert.match(harness.notifications.at(-1)?.message ?? "", /conflicts with protected LFS path/i);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("restore rejects a protected LFS ancestor of a target path", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    await harness.writeRepoFile(".gitattributes", "asset.bin filter=lfs\n");
+    await harness.writeRepoFile("asset.bin/notes.txt", "target note\n");
+    const targetCommit = await harness.captureSnapshot();
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.process", ""]);
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.clean", "false"]);
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.required", "true"]);
+    harness.currentSession.replaceEntries([
+      { type: "message", id: "protected-ancestor-target", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: [{ type: "text", text: "target" }] } },
+      {
+        type: "custom", id: "protected-ancestor-op", parentId: "protected-ancestor-target",
+        timestamp: new Date().toISOString(), customType: "rewind-op",
+        data: { v: 2, snapshots: [targetCommit], bindings: [["protected-ancestor-target", 0]] },
+      },
+    ]);
+    await harness.invoke("session_start", {});
+    await rm(path.join(harness.repoRoot, "asset.bin"), { recursive: true });
+    await harness.writeRepoFile("asset.bin", "protected asset\n");
+    harness.enqueueSelection("Restore files to that point");
+    assert.deepEqual(await harness.invoke("session_before_tree", { preparation: { targetId: "protected-ancestor-target" } }), { cancel: true });
+    assert.equal(harness.readRepoFile("asset.bin"), "protected asset\n");
+    assert.match(harness.notifications.at(-1)?.message ?? "", /conflicts with protected LFS path asset\.bin/);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("an unreadable unrelated ignored directory does not block restoring a file", async (t) => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    await harness.writeRepoFile("notes.txt", "target\n");
+    const targetCommit = await harness.captureSnapshot();
+    harness.currentSession.replaceEntries([
+      { type: "message", id: "private-target", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: [{ type: "text", text: "target" }] } },
+      { type: "custom", id: "private-op", parentId: "private-target", timestamp: new Date().toISOString(), customType: "rewind-op", data: { v: 2, snapshots: [targetCommit], bindings: [["private-target", 0]] } },
+    ]);
+    await harness.invoke("session_start", {});
+    await harness.writeRepoFile("notes.txt", "current\n");
+    await harness.writeRepoFile(".gitignore", ".private/\n");
+    await harness.writeRepoFile(".private/secret.txt", "secret\n");
+    const privateDir = path.join(harness.repoRoot, ".private");
+    await chmod(privateDir, 0);
+    try {
+      await readdir(privateDir);
+      t.skip("runtime can still read mode-000 directories (for example, running as root)");
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EACCES") throw error;
+    }
+    harness.enqueueSelection("Restore files to that point");
+    assert.equal(await harness.invoke("session_before_tree", { preparation: { targetId: "private-target" } }), undefined);
+    assert.equal(harness.readRepoFile("notes.txt"), "target\n");
+  } finally {
+    await chmod(path.join(harness.repoRoot, ".private"), 0o700).catch(() => {});
+    await harness.cleanup();
+  }
+});
+
+test("restore removes a git-renamed path when rewinding to its old name", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    await harness.writeRepoFile("old.txt", "target\n");
+    const targetCommit = await harness.captureSnapshot();
+    await runGitChecked(harness.repoRoot, ["mv", "old.txt", "new.txt"]);
+    harness.currentSession.replaceEntries([
+      { type: "message", id: "rename-target", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: [{ type: "text", text: "target" }] } },
+      {
+        type: "custom", id: "rename-op", parentId: "rename-target",
+        timestamp: new Date().toISOString(), customType: "rewind-op",
+        data: { v: 2, snapshots: [targetCommit], bindings: [["rename-target", 0]] },
+      },
+    ]);
+    await harness.invoke("session_start", {});
+    harness.enqueueSelection("Restore files to that point");
+    assert.equal(await harness.invoke("session_before_tree", { preparation: { targetId: "rename-target" } }), undefined);
+    assert.equal(existsSync(path.join(harness.repoRoot, "old.txt")), true);
+    assert.equal(existsSync(path.join(harness.repoRoot, "new.txt")), false);
+    assert.equal(await freshIndexTree(harness.repoRoot), await gitStdout(harness.repoRoot, ["rev-parse", `${targetCommit}^{tree}`]));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("checkpoints capture ordinary descendants under historical LFS paths", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    await harness.writeRepoFile("asset.bin", "tracked content\n");
+    await harness.captureSnapshot();
+    await harness.writeRepoFile(".gitattributes", "*.bin filter=lfs\n");
+    await rm(path.join(harness.repoRoot, "asset.bin"));
+    await harness.writeRepoFile("asset.bin/notes.txt", "ordinary note\n");
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.process", ""]);
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.clean", "false"]);
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.required", "true"]);
+    harness.currentSession.replaceEntries([markerEntry("ordinary-under-lfs")]);
+    await harness.invoke("session_start", {});
+    const tree = await checkpointTree(harness, "ordinary-under-lfs");
+    assert.equal(await gitStdout(harness.repoRoot, ["show", `${tree}:asset.bin/notes.txt`]), "ordinary note");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("restore includes ordinary files beneath a historical LFS path", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    await harness.writeRepoFile("asset.bin", "historical asset\n");
+    const targetCommit = await harness.captureSnapshot();
+    await harness.writeRepoFile(".gitattributes", "*.bin filter=lfs\n");
+    await rm(path.join(harness.repoRoot, "asset.bin"));
+    await harness.writeRepoFile("asset.bin/notes.txt", "ordinary current note\n");
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.process", ""]);
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.clean", "false"]);
+    await runGitChecked(harness.repoRoot, ["config", "filter.lfs.required", "true"]);
+    harness.currentSession.replaceEntries([
+      { type: "message", id: "historical-lfs-target", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: [{ type: "text", text: "target" }] } },
+      { type: "custom", id: "historical-lfs-op", parentId: "historical-lfs-target", timestamp: new Date().toISOString(), customType: "rewind-op", data: { v: 2, snapshots: [targetCommit], bindings: [["historical-lfs-target", 0]] } },
+    ]);
+    await harness.invoke("session_start", {});
+    assert.equal(await gitStdout(harness.repoRoot, ["check-attr", "filter", "--", "asset.bin"]), "asset.bin: filter: lfs");
+    assert.equal(await gitStdout(harness.repoRoot, ["check-attr", "filter", "--", "asset.bin/notes.txt"]), "asset.bin/notes.txt: filter: unspecified");
+    harness.enqueueSelection("Restore files to that point");
+    assert.equal(await harness.invoke("session_before_tree", { preparation: { targetId: "historical-lfs-target" } }), undefined);
+    assert.equal(existsSync(path.join(harness.repoRoot, "asset.bin/notes.txt")), false);
+    assert.equal(existsSync(path.join(harness.repoRoot, ".gitattributes")), false);
+    await harness.invoke("session_tree", {});
+    harness.enqueueSelection("Undo last file rewind");
+    assert.deepEqual(await harness.invoke("session_before_tree", { preparation: { targetId: "historical-lfs-target" } }), { cancel: true });
+    assert.equal(harness.readRepoFile("asset.bin/notes.txt"), "ordinary current note\n");
+    assert.equal(harness.readRepoFile(".gitattributes"), "*.bin filter=lfs\n");
   } finally {
     await harness.cleanup();
   }

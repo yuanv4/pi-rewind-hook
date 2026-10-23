@@ -778,6 +778,65 @@ export default function rewindExtension(pi: ExtensionAPI) {
     return stdout.split("\0").filter(Boolean);
   }
 
+  async function getRestoreRelevantPaths(root: string, targetPaths: string[]): Promise<{ paths: Set<string>; resolvedTargets: Map<string, string> }> {
+    const paths = new Set((await getWorktreePaths(root)).filter((path) => existsSync(resolve(root, path))));
+    const resolvedTargets = new Map<string, string>();
+    const inspectTargetPath = async (repoPath: string) => {
+      const segments = repoPath.split("/");
+      const actualSegments: string[] = [];
+      let directory = root;
+      let currentStat;
+
+      for (let index = 0; index < segments.length; index += 1) {
+        const entries = await readdir(directory, { withFileTypes: true });
+        const requested = segments[index]!;
+        let actual = entries.find((entry) => entry.name === requested)?.name;
+        if (!actual) {
+          try {
+            await lstat(join(directory, requested));
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+              currentStat = undefined;
+              actualSegments.push(...segments.slice(index));
+              break;
+            }
+            throw error;
+          }
+          actual = entries.find((entry) => entry.name.toLowerCase() === requested.toLowerCase())?.name;
+          if (!actual) break;
+        }
+
+        actualSegments.push(actual);
+        const absolute = join(directory, actual);
+        currentStat = await lstat(absolute);
+        if (!currentStat.isDirectory()) {
+          paths.add(actualSegments.join("/"));
+          if (index < segments.length - 1) actualSegments.push(...segments.slice(index + 1));
+          break;
+        }
+        directory = absolute;
+      }
+
+      const resolved = actualSegments.join("/");
+      resolvedTargets.set(repoPath, resolved);
+      if (actualSegments.length === segments.length && currentStat?.isDirectory()) {
+        const walk = async (absolute: string, prefix: string) => {
+          const entries = await readdir(absolute, { withFileTypes: true });
+          for (const entry of entries) {
+            if (entry.name === ".git") continue;
+            const childPath = `${prefix}/${entry.name}`;
+            if (entry.isDirectory()) await walk(join(absolute, entry.name), childPath);
+            else if (entry.isFile() || entry.isSymbolicLink()) paths.add(childPath);
+          }
+        };
+        await walk(directory, resolved);
+      }
+    };
+
+    for (const targetPath of targetPaths) await inspectTargetPath(targetPath);
+    return { paths, resolvedTargets };
+  }
+
   async function getTreePaths(root: string, treeSha: string): Promise<string[]> {
     const { stdout } = await execGitChecked(["-C", root, "ls-tree", "-r", "-z", "--name-only", treeSha]);
     return stdout.split("\0").filter(Boolean);
@@ -810,9 +869,22 @@ export default function rewindExtension(pi: ExtensionAPI) {
   async function stageSnapshotIndex(root: string, env: NodeJS.ProcessEnv, lfsPaths: Set<string>) {
     // Exclude before add: even a temporary add would hash large files and run LFS filters.
     await removeSnapshotIndexPaths(root, env, lfsPaths);
-    const add = execAsync(`${SNAPSHOT_GIT} -c core.autocrlf=false add -A --pathspec-from-file=- --pathspec-file-nul`, { cwd: root, env });
-    add.child.stdin?.end([".", ...[...lfsPaths].map((path) => `:(exclude,literal)${path}`)].join("\0") + "\0", "utf8");
-    await add;
+    const ignored = await execAsync(`${SNAPSHOT_GIT} ls-files --cached --ignored --exclude-standard -z`, { cwd: root, env, maxBuffer: LIST_MAX_BUFFER });
+    await removeSnapshotIndexPaths(root, env, new Set(ignored.stdout.split("\0").filter(Boolean)));
+    const tracked = await execAsync(`${SNAPSHOT_GIT} ls-files --cached -z`, { cwd: root, env, maxBuffer: LIST_MAX_BUFFER });
+    const trackedPaths = tracked.stdout.split("\0").filter((path) => path && !lfsPaths.has(path));
+    if (trackedPaths.length > 0) {
+      const update = execAsync(`${SNAPSHOT_GIT} --literal-pathspecs -c core.autocrlf=false add -u --pathspec-from-file=- --pathspec-file-nul`, { cwd: root, env });
+      update.child.stdin?.end(trackedPaths.join("\0") + "\0", "utf8");
+      await update;
+    }
+    const untracked = await execAsync(`${SNAPSHOT_GIT} ls-files --others --exclude-standard -z`, { cwd: root, env, maxBuffer: LIST_MAX_BUFFER });
+    const untrackedPaths = untracked.stdout.split("\0").filter((path) => path && !lfsPaths.has(path));
+    if (untrackedPaths.length > 0) {
+      const add = execAsync(`${SNAPSHOT_GIT} --literal-pathspecs -c core.autocrlf=false add -A --pathspec-from-file=- --pathspec-file-nul`, { cwd: root, env });
+      add.child.stdin?.end(untrackedPaths.join("\0") + "\0", "utf8");
+      await add;
+    }
   }
 
   async function filterTree(root: string, treeSha: string, lfsPaths: Set<string>): Promise<string> {
@@ -1017,6 +1089,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
     const result = await execGitChecked([
       "-C", root,
       "diff",
+      "--no-renames",
       "--name-only",
       "--diff-filter=D",
       "-z",
@@ -1032,7 +1105,21 @@ export default function rewindExtension(pi: ExtensionAPI) {
     const root = await getRepoRoot(pi.exec);
     const originalTargetTreeSha = await getCommitTreeSha(targetCommitSha);
     const targetPaths = await getTreePaths(root, originalTargetTreeSha);
-    const lfsPaths = await getLfsPaths(root, [...new Set([...await getWorktreePaths(root), ...targetPaths])]);
+    const { paths: existingPaths, resolvedTargets } = await getRestoreRelevantPaths(root, targetPaths);
+    const lfsPaths = await getLfsPaths(root, [...new Set([...existingPaths, ...targetPaths])]);
+    const protectedPaths = [...existingPaths].filter((path) => lfsPaths.has(path));
+    for (const protectedPath of protectedPaths) {
+      for (const targetPath of targetPaths) {
+        const resolvedTarget = resolvedTargets.get(targetPath) ?? targetPath;
+        const overlaps = resolvedTarget === protectedPath
+          || resolvedTarget.startsWith(`${protectedPath}/`)
+          || protectedPath.startsWith(`${resolvedTarget}/`);
+        if (overlaps && targetPath !== protectedPath) {
+          throw new Error(`refusing restore: target path ${targetPath} conflicts with protected LFS path ${protectedPath}`);
+        }
+      }
+    }
+
     // Use the same restore domain for capture, comparison, deletion and verification.
     const { treeSha: currentTreeSha } = await captureWorktreeTree(lfsPaths);
     const targetTreeSha = await filterTree(root, originalTargetTreeSha, lfsPaths);
