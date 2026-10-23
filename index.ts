@@ -1,5 +1,5 @@
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { exec as execCb, execFile as execFileCb } from "child_process";
+import { exec as execCb } from "child_process";
 import { existsSync, readFileSync, realpathSync } from "fs";
 import { lstat, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "fs/promises";
 import { homedir, tmpdir } from "os";
@@ -7,7 +7,6 @@ import { dirname, isAbsolute, join, relative, resolve } from "path";
 import { promisify } from "util";
 
 const execAsync = promisify(execCb);
-const execFileAsync = promisify(execFileCb);
 
 const STORE_REF = "refs/pi-rewind/store";
 const STATUS_KEY = "rewind";
@@ -38,7 +37,6 @@ type BindingTuple = [entryId: string, snapshotIndex: number];
 interface RewindSettings {
   rewind?: {
     silentCheckpoints?: boolean;
-    excludeGlobs?: string[];
     retention?: {
       maxSnapshots?: number;
       maxAgeDays?: number;
@@ -91,7 +89,6 @@ interface GitlinkEntry {
 interface SnapshotIndex {
   root: string;
   dir: string;
-  excludePathspecs?: string;
   ignoreCase?: boolean;
   externalAttributeFiles?: string[];
   conversionInputs?: string;
@@ -202,8 +199,8 @@ function getDefaultSessionsDir(): string {
   return join(getAgentDir(), "sessions");
 }
 
-function getSettings(refresh = false): RewindSettings {
-  if (cachedSettings && !refresh) {
+function getSettings(): RewindSettings {
+  if (cachedSettings) {
     return cachedSettings;
   }
 
@@ -219,15 +216,6 @@ function getSettings(refresh = false): RewindSettings {
 
 function getSilentCheckpointsSetting(): boolean {
   return getSettings().rewind?.silentCheckpoints === true;
-}
-
-function getExcludePathspecs(settings: RewindSettings = getSettings()): string[] {
-  const configured = settings.rewind?.excludeGlobs;
-  if (!Array.isArray(configured)) return [];
-  return configured.flatMap((pattern) => {
-    if (typeof pattern !== "string" || !pattern.trim()) return [];
-    return [`:(exclude,glob,icase)${pattern.trim()}`];
-  });
 }
 
 function getRetentionSettings(): RewindRetentionSettings | undefined {
@@ -490,8 +478,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
   }
 
   async function execGitChecked(args: string[]): Promise<GitExecResult> {
-    const root = await getRepoRoot(pi.exec);
-    const result = await pi.exec("git", ["-C", root, ...args]);
+    const result = await pi.exec("git", args);
     if (result.code !== 0) {
       const stderr = result.stderr.trim();
       throw new Error(stderr || `git ${args.join(" ")} failed with code ${result.code}`);
@@ -510,31 +497,10 @@ export default function rewindExtension(pi: ExtensionAPI) {
     return repoRoot;
   }
 
-  async function getGitlinkEntries(
-    treeSha: string,
-    gitPrefix: string[] = [],
-    excludePathspecs?: string[],
-  ): Promise<GitlinkEntry[]> {
-    const result = await execGitChecked([...gitPrefix, "ls-tree", "-r", "-z", treeSha, "--"]);
-    const entries = parseGitlinkEntries(result.stdout);
-    if (!excludePathspecs?.length) return entries;
-
-    // ls-tree does not implement the glob/icase pathspec magic. Use diff's
-    // supported pathspec matching to collect the paths in the snapshot domain.
-    const included = await execGitChecked([
-      ...gitPrefix,
-      "diff",
-      "--ignore-submodules=none",
-      "--name-only",
-      "-z",
-      EMPTY_TREE_SHA,
-      treeSha,
-      "--",
-      ".",
-      ...excludePathspecs,
-    ]);
-    const includedPaths = new Set(included.stdout.split("\0").filter(Boolean));
-    return entries.filter((entry) => includedPaths.has(entry.path));
+  async function getGitlinkEntries(treeSha: string, gitPrefix: string[] = []): Promise<GitlinkEntry[]> {
+    const prefix = gitPrefix.length > 0 ? gitPrefix : ["-C", await getRepoRoot(pi.exec)];
+    const result = await execGitChecked([...prefix, "ls-tree", "-r", "-z", treeSha, "--"]);
+    return parseGitlinkEntries(result.stdout);
   }
 
   function parseGitlinkEntries(output: string): GitlinkEntry[] {
@@ -548,10 +514,8 @@ export default function rewindExtension(pi: ExtensionAPI) {
     });
   }
 
-  async function getIndexedGitlinkEntries(excludePathspecs?: string[]): Promise<GitlinkEntry[]> {
-    const args = ["ls-files", "--stage", "-z"];
-    if (excludePathspecs) args.push("--", ".", ...excludePathspecs);
-    const result = await execGitChecked(args);
+  async function getIndexedGitlinkEntries(): Promise<GitlinkEntry[]> {
+    const result = await execGitChecked(["-C", await getRepoRoot(pi.exec), "ls-files", "--stage", "-z"]);
     return parseGitlinkEntries(result.stdout);
   }
 
@@ -803,19 +767,70 @@ export default function rewindExtension(pi: ExtensionAPI) {
     return seen;
   }
 
-  function captureWorktreeTree(excludePathspecs?: string[]): Promise<{ treeSha: string }> {
-    const exclusions = excludePathspecs ?? getExcludePathspecs(getSettings(true));
-    return enqueueCapture(() => captureWorktreeTreeNow(exclusions));
+  function captureWorktreeTree(lfsPaths?: Set<string>): Promise<{ treeSha: string }> {
+    return enqueueCapture(() => captureWorktreeTreeNow(lfsPaths));
   }
 
-  async function captureWorktreeTreeNow(excludePathspecs: string[]): Promise<{ treeSha: string }> {
-    const root = await getRepoRoot(pi.exec);
-    const excludePathspecsKey = JSON.stringify(excludePathspecs);
-    if (snapshotIndex && snapshotIndex.excludePathspecs !== excludePathspecsKey) {
-      // A reused snapshot index retains previously captured paths, including paths
-      // newly excluded by a configuration change. Rebuild it from empty.
-      await disposeSnapshotIndex();
+  async function getWorktreePaths(root: string, env?: NodeJS.ProcessEnv): Promise<string[]> {
+    const { stdout } = await execAsync("git ls-files --cached --others --exclude-standard -z", {
+      cwd: root, env, maxBuffer: LIST_MAX_BUFFER,
+    });
+    return stdout.split("\0").filter(Boolean);
+  }
+
+  async function getTreePaths(root: string, treeSha: string): Promise<string[]> {
+    const { stdout } = await execGitChecked(["-C", root, "ls-tree", "-r", "-z", "--name-only", treeSha]);
+    return stdout.split("\0").filter(Boolean);
+  }
+
+  async function getLfsPaths(root: string, paths: string[]): Promise<Set<string>> {
+    if (paths.length === 0) return new Set();
+    const result = execAsync("git check-attr -z --stdin filter", {
+      cwd: root, encoding: "latin1", maxBuffer: LIST_MAX_BUFFER,
+    });
+    result.child.stdin?.end(paths.map((path) => `${path}\0`).join(""), "utf8");
+    const { stdout } = await result;
+    const records = stdout.split("\0");
+    const lfsPaths = new Set<string>();
+    for (let index = 0; index + 2 < records.length; index += 3) {
+      if (records[index + 1] === "filter" && records[index + 2] === "lfs") {
+        lfsPaths.add(Buffer.from(records[index]!, "latin1").toString("utf8"));
+      }
     }
+    return lfsPaths;
+  }
+
+  async function removeSnapshotIndexPaths(root: string, env: NodeJS.ProcessEnv, paths: Set<string>) {
+    if (paths.size === 0) return;
+    const update = execAsync(`${SNAPSHOT_GIT} update-index --force-remove -z --stdin`, { cwd: root, env });
+    update.child.stdin?.end([...paths].map((path) => `${path}\0`).join(""), "utf8");
+    await update;
+  }
+
+  async function stageSnapshotIndex(root: string, env: NodeJS.ProcessEnv, lfsPaths: Set<string>) {
+    // Exclude before add: even a temporary add would hash large files and run LFS filters.
+    await removeSnapshotIndexPaths(root, env, lfsPaths);
+    const add = execAsync(`${SNAPSHOT_GIT} -c core.autocrlf=false add -A --pathspec-from-file=- --pathspec-file-nul`, { cwd: root, env });
+    add.child.stdin?.end([".", ...[...lfsPaths].map((path) => `:(exclude,literal)${path}`)].join("\0") + "\0", "utf8");
+    await add;
+  }
+
+  async function filterTree(root: string, treeSha: string, lfsPaths: Set<string>): Promise<string> {
+    if (lfsPaths.size === 0) return treeSha;
+    const dir = await mkdtemp(join(tmpdir(), "pi-rewind-tree-"));
+    const env = { ...process.env, GIT_INDEX_FILE: join(dir, "index") };
+    try {
+      await execAsync(`${SNAPSHOT_GIT} read-tree ${treeSha}`, { cwd: root, env });
+      await removeSnapshotIndexPaths(root, env, lfsPaths);
+      const { stdout } = await execAsync(`${SNAPSHOT_GIT} write-tree`, { cwd: root, env });
+      return stdout.trim();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  async function captureWorktreeTreeNow(frozenLfsPaths?: Set<string>): Promise<{ treeSha: string }> {
+    const root = await getRepoRoot(pi.exec);
 
     try {
       // Windows reports creation time as ctime, so its stat check can miss a rewrite that
@@ -835,25 +850,20 @@ export default function rewindExtension(pi: ExtensionAPI) {
           env = await getSnapshotIndexEnv(root);
         }
       }
+      const candidates = frozenLfsPaths ? [] : [...new Set([
+        ...await getWorktreePaths(root), ...await getWorktreePaths(root, env),
+      ])];
+      const lfsPaths = frozenLfsPaths ?? await getLfsPaths(root, candidates);
       // Git for Windows' default autocrlf=true would restore LF files as CRLF.
-      const addArgs = [
-        "-c", "core.trustctime=true",
-        "-c", "core.checkStat=default",
-        "-c", "core.ignoreStat=false",
-        "-c", "core.fsmonitor=false",
-        "-c", "core.autocrlf=false",
-        "add", "-A", "--", ".", ...excludePathspecs,
-      ];
-      await execFileAsync("git", addArgs, { cwd: root, env });
+      await stageSnapshotIndex(root, env, lfsPaths);
       let listing = await inspectSnapshotIndex(root, env);
       // Start over whenever reuse could differ from a fresh index.
       if (reused && (await reusedIndexIsStale(root, env, listing))) {
         await disposeSnapshotIndex();
         env = await getSnapshotIndexEnv(root);
-        await execFileAsync("git", addArgs, { cwd: root, env });
+        await stageSnapshotIndex(root, env, lfsPaths);
         listing = await inspectSnapshotIndex(root, env);
       }
-      snapshotIndex!.excludePathspecs = excludePathspecsKey;
       snapshotIndex!.conversionInputs = listing.conversionInputs;
       snapshotIndex!.changeTime = changeTime;
       snapshotIndex!.entries = changeTime === undefined ? undefined : listing.entries;
@@ -863,9 +873,9 @@ export default function rewindExtension(pi: ExtensionAPI) {
       const treeSha = stdout.trim();
       await forgetRacyStatData(root, env, listing, startedSec);
       const entriesByPath = new Map<string, GitlinkEntry>();
-      for (const entry of await getIndexedGitlinkEntries(excludePathspecs)) entriesByPath.set(entry.path, entry);
+      for (const entry of await getIndexedGitlinkEntries()) entriesByPath.set(entry.path, entry);
       for (const entry of await getGitlinkEntries(treeSha)) entriesByPath.set(entry.path, entry);
-      await assertSubmoduleWorktreesClean(root, [...entriesByPath.values()], "capture exact files");
+      await assertSubmoduleWorktreesClean(root, [...entriesByPath.values()].filter((entry) => !lfsPaths.has(entry.path)), "capture exact files");
       return { treeSha };
     } catch (error) {
       // A failed capture must not seed the next one.
@@ -1003,83 +1013,67 @@ export default function rewindExtension(pi: ExtensionAPI) {
     }
   }
 
-  async function treesEqualInDomain(leftTreeSha: string, rightTreeSha: string, excludePathspecs: string[]): Promise<boolean> {
+  async function getDeletedPaths(root: string, currentTreeSha: string, targetTreeSha: string): Promise<string[]> {
     const result = await execGitChecked([
+      "-C", root,
       "diff",
-      "--ignore-submodules=none",
-      "--name-only",
-      "-z",
-      leftTreeSha,
-      rightTreeSha,
-      "--",
-      ".",
-      ...excludePathspecs,
-    ]);
-    return result.stdout.length === 0;
-  }
-
-  async function getDeletedPaths(
-    currentTreeSha: string,
-    targetTreeSha: string,
-    excludePathspecs: string[],
-  ): Promise<string[]> {
-    const result = await execGitChecked([
-      "diff",
-      "--ignore-submodules=none",
       "--name-only",
       "--diff-filter=D",
       "-z",
       currentTreeSha,
       targetTreeSha,
       "--",
-      ".",
-      ...excludePathspecs,
     ]);
 
     return result.stdout.split("\0").filter(Boolean);
   }
 
   async function restoreCommitExactly(targetCommitSha: string): Promise<{ changed: boolean; undoCommitSha?: string; targetTreeSha: string }> {
-    const excludePathspecs = getExcludePathspecs(getSettings(true));
-    const { treeSha: currentTreeSha } = await captureWorktreeTree(excludePathspecs);
-    const targetTreeSha = await getCommitTreeSha(targetCommitSha);
+    const root = await getRepoRoot(pi.exec);
+    const originalTargetTreeSha = await getCommitTreeSha(targetCommitSha);
+    const targetPaths = await getTreePaths(root, originalTargetTreeSha);
+    const lfsPaths = await getLfsPaths(root, [...new Set([...await getWorktreePaths(root), ...targetPaths])]);
+    // Use the same restore domain for capture, comparison, deletion and verification.
+    const { treeSha: currentTreeSha } = await captureWorktreeTree(lfsPaths);
+    const targetTreeSha = await filterTree(root, originalTargetTreeSha, lfsPaths);
+    const targetExact = originalTargetTreeSha === targetTreeSha ? { commitSha: targetCommitSha, treeSha: targetTreeSha } : null;
 
     const currentSubmodules = await getGitlinkEntries(currentTreeSha);
-    const targetSubmodules = await getGitlinkEntries(targetTreeSha, [], excludePathspecs);
+    const targetSubmodules = await getGitlinkEntries(targetTreeSha);
     if (currentSubmodules.length > 0 || targetSubmodules.length > 0) {
       await prepareSubmoduleRestore(repoRoot!, currentSubmodules, targetSubmodules);
     }
 
-    if (await treesEqualInDomain(currentTreeSha, targetTreeSha, excludePathspecs)) {
-      lastExact = targetTreeSha === currentTreeSha
-        ? { commitSha: targetCommitSha, treeSha: currentTreeSha }
-        : null;
+    if (currentTreeSha === targetTreeSha) {
+      lastExact = targetExact;
       return { changed: false, targetTreeSha };
     }
 
     const undoCommitSha = await ensureSnapshotForTree(currentTreeSha);
-    const pathsToDelete = await getDeletedPaths(currentTreeSha, targetTreeSha, excludePathspecs);
+    const pathsToDelete = (await getDeletedPaths(root, currentTreeSha, targetTreeSha)).filter((path) => !lfsPaths.has(path));
     await deletePathsFromWorkingTree(pathsToDelete);
-    await execGitChecked([
-      "-c",
-      "core.autocrlf=false",
-      "restore",
-      `--source=${targetCommitSha}`,
-      "--worktree",
-      "--",
-      ".",
-      ...excludePathspecs,
-    ]);
+    const pathsToRestore = targetPaths.filter((path) => !lfsPaths.has(path));
+    if (pathsToRestore.length > 0) {
+      const dir = await mkdtemp(join(tmpdir(), "pi-rewind-restore-"));
+      try {
+        const pathspecFile = join(dir, "paths");
+        await writeFile(pathspecFile, pathsToRestore.map((path) => `:(literal)${path}\0`).join(""));
+        await execGitChecked([
+          "-C", root, "-c", "core.autocrlf=false", "restore", `--source=${targetCommitSha}`, "--worktree",
+          `--pathspec-from-file=${pathspecFile}`, "--pathspec-file-nul",
+        ]);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    }
     if (targetSubmodules.length > 0) {
       await restoreSubmodules(repoRoot!, targetSubmodules);
+      const { treeSha: restoredTreeSha } = await captureWorktreeTree(lfsPaths);
+      if (restoredTreeSha !== targetTreeSha) {
+        throw new Error(`submodule restore did not produce target tree ${targetTreeSha}`);
+      }
     }
-    const { treeSha: restoredTreeSha } = await captureWorktreeTree(excludePathspecs);
-    if (!(await treesEqualInDomain(targetTreeSha, restoredTreeSha, excludePathspecs))) {
-      throw new Error(`restore did not produce target state in the configured snapshot domain ${targetTreeSha}`);
-    }
-    lastExact = targetTreeSha === restoredTreeSha
-      ? { commitSha: targetCommitSha, treeSha: restoredTreeSha }
-      : null;
+    lastExact = targetExact;
     return { changed: true, undoCommitSha, targetTreeSha };
   }
 
@@ -1328,7 +1322,6 @@ export default function rewindExtension(pi: ExtensionAPI) {
   }
 
   async function reconstructState(ctx: ExtensionContext) {
-    const excludePathspecs = getExcludePathspecs(getSettings(true));
     entryToCommit.clear();
     activeBranchState = {};
     lastExact = null;
@@ -1362,17 +1355,14 @@ export default function rewindExtension(pi: ExtensionAPI) {
     }
 
     if (activeBranchState.currentCommitSha && (await commitExists(activeBranchState.currentCommitSha))) {
-      const targetTreeSha = await getCommitTreeSha(activeBranchState.currentCommitSha);
-      const { treeSha: worktreeTreeSha } = await captureWorktreeTree(excludePathspecs);
+      activeBranchState.currentTreeSha = await getCommitTreeSha(activeBranchState.currentCommitSha);
+      const { treeSha: worktreeTreeSha } = await captureWorktreeTree();
 
-      if (await treesEqualInDomain(targetTreeSha, worktreeTreeSha, excludePathspecs)) {
-        activeBranchState.currentTreeSha = targetTreeSha;
-        if (targetTreeSha === worktreeTreeSha) {
-          lastExact = {
-            commitSha: activeBranchState.currentCommitSha,
-            treeSha: worktreeTreeSha,
-          };
-        }
+      if (activeBranchState.currentTreeSha === worktreeTreeSha) {
+        lastExact = {
+          commitSha: activeBranchState.currentCommitSha,
+          treeSha: activeBranchState.currentTreeSha,
+        };
       }
     }
   }
